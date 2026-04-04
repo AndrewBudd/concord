@@ -62,6 +62,7 @@ public class RuntimeConfiguration {
                         List<String> jvmParams,
                         String mainClass,
                         Path persistentWorkDir,
+                        Path sessionWorkDir,
                         boolean cleanRunnerDescendants,
                         boolean segmentedLogs) {
 
@@ -93,9 +94,10 @@ public class RuntimeConfiguration {
             var jvmParams = cfg.getStringList("jvmParams");
             var mainClass = cfg.getString("mainClass");
             var persistentWorkDir = getOptionalAbsolutePath(cfg, "persistentWorkDir");
+            var sessionWorkDir = getOptionalAbsolutePath(cfg, "sessionWorkDir");
             var cleanRunnerDescendants = cfg.getBoolean("cleanRunnerDescendants");
             var segmentedLogs = cfg.getBoolean("segmentedLogs");
-            return new Entry(path, cfgDir, javaCmd, jvmParams, mainClass, persistentWorkDir, cleanRunnerDescendants, segmentedLogs);
+            return new Entry(path, cfgDir, javaCmd, jvmParams, mainClass, persistentWorkDir, sessionWorkDir, cleanRunnerDescendants, segmentedLogs);
         }
 
         private static String getJavaCmd(Config cfg) {

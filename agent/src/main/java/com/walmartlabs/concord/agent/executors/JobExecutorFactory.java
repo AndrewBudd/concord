@@ -117,6 +117,7 @@ public class JobExecutorFactory {
                     .segmentedLogs(runtimeCfg.segmentedLogs())
                     .workDirMasking(agentCfg.isWorkDirMaskings())
                     .persistentWorkDir(runtimeCfg.persistentWorkDir())
+                    .sessionWorkDir(runtimeCfg.sessionWorkDir())
                     .preforkEnabled(preForkCfg.isEnabled())
                     .cleanRunnerDescendants(runtimeCfg.cleanRunnerDescendants())
                     .build();

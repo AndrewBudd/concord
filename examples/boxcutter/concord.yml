@@ -1,0 +1,139 @@
+configuration:
+  runtime: "concord-v2"
+
+  arguments:
+    # Boxcutter orchestrator host (SSH target)
+    boxcutterHost: "boxcutter"
+
+    # Path to SSH private key for boxcutter access (optional if using ssh-agent)
+    # sshKeyPath: "/path/to/id_ed25519"
+
+    # Concord server URL for the boxcutter agent to connect back to
+    serverApiUrl: "http://concord-server:8001"
+
+    # API key for the boxcutter agent to authenticate with the server
+    serverApiKey: "${crypto.exportAsString('Default', 'agentApiKey', null)}"
+
+flows:
+  default:
+    # Step 1: Provision a boxcutter VM and start a Concord agent on it
+    - task: boxcutter
+      in:
+        action: start
+        host: ${boxcutterHost}
+        type: qemu
+        vcpu: 4
+        ram: 8192
+        serverApiUrl: ${serverApiUrl}
+        serverApiKey: ${serverApiKey}
+      out:
+        session: ${session}
+        vmName: ${vmName}
+
+    - log: "Boxcutter VM '${vmName}' is ready with session ${session.sessionId}"
+
+    # Step 2: Run a deployment step on the boxcutter VM
+    - task: boxcutter
+      in:
+        action: runStep
+        session: ${session}
+        entryPoint: deploy
+        arguments:
+          appVersion: "2.1.0"
+        outVars:
+          - deployResult
+      out:
+        session: ${session}
+        deployResult: ${deployResult}
+
+    - log: "Deployment result: ${deployResult}"
+
+    # Step 3: Run tests on the same VM (shares filesystem state from deploy)
+    - task: boxcutter
+      in:
+        action: runStep
+        session: ${session}
+        entryPoint: test
+        arguments:
+          testSuite: "integration"
+        outVars:
+          - testsPassed
+          - testReport
+      out:
+        session: ${session}
+        testsPassed: ${testsPassed}
+        testReport: ${testReport}
+
+    - log: "Tests passed: ${testsPassed}"
+
+    # Step 4: Conditionally promote based on test results
+    - if: ${testsPassed}
+      then:
+        - task: boxcutter
+          in:
+            action: runStep
+            session: ${session}
+            entryPoint: promote
+            arguments:
+              environment: "staging"
+          out:
+            session: ${session}
+
+    # Step 5: Tear down the VM
+    - task: boxcutter
+      in:
+        action: destroy
+        session: ${session}
+
+    - log: "Pipeline complete. VM destroyed."
+
+  # --- Sub-workflows (executed on the boxcutter VM) ---
+
+  deploy:
+    - log: "Deploying application v${appVersion}..."
+
+    - task: http
+      in:
+        method: GET
+        url: "https://releases.example.com/app-${appVersion}.tar.gz"
+        out: "/opt/app/release.tar.gz"
+      ignoreErrors: true
+
+    - log: "Application deployed successfully"
+
+    - set:
+        deployResult: "deployed-${appVersion}"
+
+  test:
+    - log: "Running ${testSuite} test suite..."
+
+    # The tests run against the app deployed in the previous step.
+    # The filesystem state from 'deploy' persists because both steps
+    # run on the same boxcutter VM with a session workspace.
+    - log: "Test suite complete"
+
+    - set:
+        testsPassed: true
+        testReport: "All ${testSuite} tests passed"
+
+  promote:
+    - log: "Promoting to ${environment}..."
+    - log: "Promotion complete"
+
+  # --- Error handlers ---
+
+  onFailure:
+    - log: "Pipeline failed, cleaning up boxcutter VM..."
+    - task: boxcutter
+      in:
+        action: destroy
+        session: ${session}
+      ignoreErrors: true
+
+  onCancel:
+    - log: "Pipeline cancelled, cleaning up..."
+    - task: boxcutter
+      in:
+        action: destroy
+        session: ${session}
+      ignoreErrors: true

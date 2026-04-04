@@ -276,6 +276,12 @@ public class RunnerJobExecutor implements JobExecutor {
     }
 
     private void cleanup(UUID instanceId, ProcessEntry pe) {
+        if (cfg.sessionWorkDir() != null) {
+            log.info("exec ['{}'] -> session workspace mode, skipping working directory cleanup: {}",
+                    instanceId, pe.getWorkDir());
+            return;
+        }
+
         Path workDir = pe.getWorkDir();
         try {
             log.info("exec ['{}'] -> removing the working directory: {}", instanceId, workDir);
@@ -509,6 +515,11 @@ public class RunnerJobExecutor implements JobExecutor {
     }
 
     protected ProcessEntry startOneTime(RunnerJob job, String[] cmd) throws IOException {
+        Path sessionWorkDir = cfg.sessionWorkDir();
+        if (sessionWorkDir != null) {
+            return startSessionWorkDir(job, cmd, sessionWorkDir);
+        }
+
         // create the parent directory of the process' ${workDir}
         Path workDir = cfg.workDirBase().resolve(job.getInstanceId().toString());
         if (!Files.exists(workDir)) {
@@ -528,6 +539,22 @@ public class RunnerJobExecutor implements JobExecutor {
         writeInstanceId(job.getInstanceId(), workDir);
 
         return start(workDir, cmd);
+    }
+
+    private ProcessEntry startSessionWorkDir(RunnerJob job, String[] cmd, Path sessionWorkDir) throws IOException {
+        if (!Files.exists(sessionWorkDir)) {
+            Files.createDirectories(sessionWorkDir);
+        }
+
+        // overlay the new payload onto the persistent session workspace
+        Path src = job.getPayloadDir();
+        log.info("startSessionWorkDir ['{}'] -> overlaying payload from {} onto session workspace {}",
+                job.getInstanceId(), src, sessionWorkDir);
+        PathUtils.copy(src, sessionWorkDir);
+
+        writeInstanceId(job.getInstanceId(), sessionWorkDir);
+
+        return start(sessionWorkDir, cmd);
     }
 
     private ProcessEntry start(Path workDir, String[] cmd) throws IOException {
@@ -785,6 +812,9 @@ public class RunnerJobExecutor implements JobExecutor {
 
         @Nullable
         Path persistentWorkDir();
+
+        @Nullable
+        Path sessionWorkDir();
 
         boolean preforkEnabled();
 
