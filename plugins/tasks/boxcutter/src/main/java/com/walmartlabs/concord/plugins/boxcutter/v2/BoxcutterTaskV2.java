@@ -20,9 +20,9 @@ package com.walmartlabs.concord.plugins.boxcutter.v2;
  * =====
  */
 
-import com.walmartlabs.concord.client2.ApiClientFactory;
 import com.walmartlabs.concord.plugins.boxcutter.BoxcutterParams;
 import com.walmartlabs.concord.plugins.boxcutter.BoxcutterTaskCommon;
+import com.walmartlabs.concord.plugins.boxcutter.MetadataMessageClient;
 import com.walmartlabs.concord.runtime.v2.sdk.*;
 
 import javax.inject.Inject;
@@ -32,14 +32,12 @@ import java.util.Map;
 
 @Named("boxcutter")
 @SuppressWarnings("unused")
-public class BoxcutterTaskV2 implements ReentrantTask {
+public class BoxcutterTaskV2 implements Task {
 
-    private final ApiClientFactory apiClientFactory;
     private final Context context;
 
     @Inject
-    public BoxcutterTaskV2(ApiClientFactory apiClientFactory, Context context) {
-        this.apiClientFactory = apiClientFactory;
+    public BoxcutterTaskV2(Context context) {
         this.context = context;
     }
 
@@ -49,19 +47,26 @@ public class BoxcutterTaskV2 implements ReentrantTask {
         merged.putAll(input.toMap());
 
         BoxcutterParams params = new BoxcutterParams(new MapBackedVariables(merged));
-        return delegate().execute(params);
+
+        String metadataUrl = params.metadataUrl();
+        MetadataMessageClient messageClient = new MetadataMessageClient(metadataUrl);
+
+        // Get our own VM name (hostname) for reply-to addressing
+        String orchestratorVm = getHostname();
+
+        BoxcutterTaskCommon delegate = new BoxcutterTaskCommon(orchestratorVm, messageClient);
+        return delegate.execute(params);
     }
 
-    @Override
-    public TaskResult resume(ResumeEvent event) throws Exception {
-        return delegate().continueAfterSuspend(event.state());
-    }
-
-    private BoxcutterTaskCommon delegate() {
-        String sessionToken = context.processConfiguration().processInfo().sessionToken();
-        return new BoxcutterTaskCommon(
-                sessionToken,
-                apiClientFactory,
-                context.processInstanceId());
+    private static String getHostname() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("hostname");
+            Process p = pb.start();
+            String hostname = new String(p.getInputStream().readAllBytes()).trim();
+            p.waitFor();
+            return hostname;
+        } catch (Exception e) {
+            return "unknown";
+        }
     }
 }

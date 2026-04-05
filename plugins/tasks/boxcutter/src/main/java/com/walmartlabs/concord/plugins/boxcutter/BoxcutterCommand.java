@@ -30,32 +30,24 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-public final class SshCommand {
+/**
+ * Executes boxcutter CLI commands (which are SSH commands to the orchestrator).
+ */
+public final class BoxcutterCommand {
 
-    private static final Logger log = LoggerFactory.getLogger(SshCommand.class);
+    private static final Logger log = LoggerFactory.getLogger(BoxcutterCommand.class);
 
     private static final long DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 
-    public static Result exec(String host, String sshKeyPath, String... command) throws Exception {
-        return exec(host, sshKeyPath, DEFAULT_TIMEOUT_MS, command);
+    public static Result exec(String... args) throws Exception {
+        return exec(DEFAULT_TIMEOUT_MS, args);
     }
 
-    public static Result exec(String host, String sshKeyPath, long timeoutMs, String... command) throws Exception {
+    public static Result exec(long timeoutMs, String... args) throws Exception {
         List<String> cmd = new ArrayList<>();
-        cmd.add("ssh");
-        cmd.add("-o");
-        cmd.add("StrictHostKeyChecking=no");
-        cmd.add("-o");
-        cmd.add("UserKnownHostsFile=/dev/null");
-        cmd.add("-o");
-        cmd.add("ConnectTimeout=30");
-        if (sshKeyPath != null) {
-            cmd.add("-i");
-            cmd.add(sshKeyPath);
-        }
-        cmd.add(host);
-        for (String c : command) {
-            cmd.add(c);
+        cmd.add("boxcutter");
+        for (String a : args) {
+            cmd.add(a);
         }
 
         log.info("exec -> running: {}", String.join(" ", cmd));
@@ -73,11 +65,11 @@ public final class SshCommand {
         boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
         if (!finished) {
             p.destroyForcibly();
-            throw new RuntimeException("SSH command timed out after " + timeoutMs + "ms: " + String.join(" ", cmd));
+            throw new RuntimeException("Boxcutter command timed out after " + timeoutMs + "ms: " + String.join(" ", cmd));
         }
 
         int exitCode = p.exitValue();
-        log.info("exec -> exit code: {}, output: {}", exitCode, output);
+        log.info("exec -> exit code: {}, output length: {}", exitCode, output.length());
 
         return new Result(exitCode, output);
     }
@@ -86,11 +78,11 @@ public final class SshCommand {
 
         public void assertSuccess(String context) {
             if (exitCode != 0) {
-                throw new RuntimeException(context + ": SSH command failed with exit code " + exitCode + ": " + output);
+                throw new RuntimeException(context + ": boxcutter command failed with exit code " + exitCode + ": " + output);
             }
         }
     }
 
-    private SshCommand() {
+    private BoxcutterCommand() {
     }
 }

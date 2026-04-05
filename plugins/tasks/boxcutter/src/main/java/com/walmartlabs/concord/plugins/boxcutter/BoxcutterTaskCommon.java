@@ -20,32 +20,42 @@ package com.walmartlabs.concord.plugins.boxcutter;
  * =====
  */
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.walmartlabs.concord.client2.*;
 import com.walmartlabs.concord.runtime.v2.sdk.TaskResult;
-import com.walmartlabs.concord.sdk.Constants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.InputStream;
 import java.io.Serializable;
 import java.util.*;
 
+/**
+ * Core logic for the boxcutter task plugin. Orchestrates ephemeral VMs
+ * using the boxcutter CLI and communicates with them via the metadata
+ * service messaging API.
+ *
+ * <p>Workflow:
+ * <ol>
+ *   <li>START: creates a VM, deploys a runner script, waits for readiness</li>
+ *   <li>RUNSTEP: sends a task message to the VM, waits for result</li>
+ *   <li>DESTROY: tears down the VM</li>
+ * </ol>
+ */
 public class BoxcutterTaskCommon {
 
     private static final Logger log = LoggerFactory.getLogger(BoxcutterTaskCommon.class);
 
-    private static final long AGENT_READY_TIMEOUT_MS = 120_000; // 2 minutes
-    private static final long AGENT_READY_POLL_MS = 2_000;
+    private static final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final String sessionToken;
-    private final ApiClientFactory apiClientFactory;
-    private final UUID currentProcessId;
+    private static final long RUNNER_READY_TIMEOUT_MS = 120_000;
+    private static final long POLL_INTERVAL_MS = 2_000;
 
-    public BoxcutterTaskCommon(String sessionToken, ApiClientFactory apiClientFactory, UUID currentProcessId) {
-        this.sessionToken = sessionToken;
-        this.apiClientFactory = apiClientFactory;
-        this.currentProcessId = currentProcessId;
+    private final String orchestratorVmName;
+    private final MetadataMessageClient messageClient;
+
+    public BoxcutterTaskCommon(String orchestratorVmName, MetadataMessageClient messageClient) {
+        this.orchestratorVmName = orchestratorVmName;
+        this.messageClient = messageClient;
     }
 
     public TaskResult execute(BoxcutterParams params) throws Exception {
@@ -56,46 +66,11 @@ public class BoxcutterTaskCommon {
         };
     }
 
-    public TaskResult continueAfterSuspend(Map<String, Serializable> state) throws Exception {
-        ResumePayload payload = ResumePayload.fromMap(state);
-
-        UUID childId = payload.childProcessId();
-        log.info("Resuming after child process {} completion", childId);
-
-        ProcessEntry entry = ClientUtils.withRetry(3, 1000,
-                () -> withClient(client -> {
-                    ProcessV2Api api = new ProcessV2Api(client);
-                    return api.getProcess(childId, Collections.emptySet());
-                }));
-
-        ProcessEntry.StatusEnum status = entry.getStatus();
-        if (status == ProcessEntry.StatusEnum.FAILED
-                || status == ProcessEntry.StatusEnum.CANCELLED
-                || status == ProcessEntry.StatusEnum.TIMED_OUT) {
-            throw new RuntimeException("Child process " + childId + " ended with status: " + status);
-        }
-
-        // collect output variables from child
-        Map<String, Object> childOut = getOutVars(childId);
-
-        // merge child output into the session state
-        Map<String, Object> sessionState = new HashMap<>(payload.sessionState());
-        sessionState.putAll(childOut);
-
-        // return updated session and child output
-        return TaskResult.success()
-                .value("session", asSerializable(sessionState))
-                .values(childOut);
-    }
-
     private TaskResult start(BoxcutterParams params) throws Exception {
-        String host = params.host();
-        String sshKeyPath = params.sshKeyPath();
         String vmType = params.vmType();
-
         String sessionId = UUID.randomUUID().toString();
 
-        // build the `ssh boxcutter new` command
+        // Build the boxcutter new command
         List<String> newCmd = new ArrayList<>();
         newCmd.add("new");
         newCmd.add("--type");
@@ -106,6 +81,8 @@ public class BoxcutterTaskCommon {
         newCmd.add(String.valueOf(params.ram()));
         newCmd.add("--disk");
         newCmd.add(params.disk());
+        newCmd.add("--desc");
+        newCmd.add("concord-session-" + sessionId);
 
         String vmName = params.vmName();
         if (vmName != null) {
@@ -113,33 +90,25 @@ public class BoxcutterTaskCommon {
             newCmd.add(vmName);
         }
 
-        log.info("Creating boxcutter VM on host {}...", host);
-        SshCommand.Result result = SshCommand.exec(host, sshKeyPath, newCmd.toArray(new String[0]));
+        log.info("Creating boxcutter VM (type={}, session={})...", vmType, sessionId);
+        BoxcutterCommand.Result result = BoxcutterCommand.exec(newCmd.toArray(new String[0]));
         result.assertSuccess("Failed to create boxcutter VM");
 
-        // parse the VM name from output (boxcutter outputs the name on creation)
+        // Parse the VM name from output
         String createdVmName = parseVmName(result.output(), vmName);
         log.info("Created boxcutter VM: {}", createdVmName);
 
-        // determine the server API URL for the agent to connect back to
-        String serverApiUrl = params.serverApiUrl();
-        String serverApiKey = params.serverApiKey();
-        String sessionWorkDir = params.sessionWorkDir();
-        String agentJarPath = params.agentJarPath();
+        // Deploy the runner script to the VM via sendkeys
+        deployRunner(createdVmName, sessionId);
 
-        // bootstrap the concord agent on the VM
-        bootstrapAgent(host, sshKeyPath, createdVmName, sessionId,
-                serverApiUrl, serverApiKey, agentJarPath, sessionWorkDir);
-
-        // wait for the agent to connect
-        log.info("Waiting for boxcutter agent (session={}) to connect...", sessionId);
-        waitForAgent(sessionId);
+        // Wait for the runner to signal it's ready
+        log.info("Waiting for runner on VM {} to become ready...", createdVmName);
+        waitForRunnerReady(createdVmName, sessionId);
 
         Map<String, Object> session = new HashMap<>();
         session.put("sessionId", sessionId);
         session.put("vmName", createdVmName);
-        session.put("host", host);
-        session.put("sshKeyPath", sshKeyPath != null ? sshKeyPath : "");
+        session.put("orchestratorVm", orchestratorVmName);
         session.put("state", new HashMap<String, Object>());
 
         return TaskResult.success()
@@ -154,90 +123,110 @@ public class BoxcutterTaskCommon {
             throw new IllegalArgumentException("'session' is required for runStep action");
         }
 
+        String vmName = (String) session.get("vmName");
         String sessionId = (String) session.get("sessionId");
-        if (sessionId == null) {
-            throw new IllegalArgumentException("session.sessionId is missing. Did you call 'start' first?");
+        if (sessionId == null || vmName == null) {
+            throw new IllegalArgumentException("session.sessionId and session.vmName are required. Did you call 'start' first?");
         }
 
         @SuppressWarnings("unchecked")
         Map<String, Object> sessionState = (Map<String, Object>) session.getOrDefault("state", Collections.emptyMap());
 
+        // Build the task message
+        Map<String, Object> taskMessage = new HashMap<>();
+        String taskId = UUID.randomUUID().toString();
+        taskMessage.put("taskId", taskId);
+        taskMessage.put("sessionId", sessionId);
+        taskMessage.put("replyTo", orchestratorVmName);
+
         String entryPoint = params.entryPoint();
+        String command = params.command();
+
+        if (command != null) {
+            taskMessage.put("type", "command");
+            taskMessage.put("command", command);
+        } else if (entryPoint != null) {
+            taskMessage.put("type", "entryPoint");
+            taskMessage.put("entryPoint", entryPoint);
+        } else {
+            throw new IllegalArgumentException("Either 'entryPoint' or 'command' is required for runStep");
+        }
+
+        // Merge session state with step arguments
         Map<String, Object> arguments = new HashMap<>(sessionState);
         arguments.putAll(params.arguments());
+        taskMessage.put("arguments", arguments);
 
         Collection<String> outVars = params.outVars();
-
-        // build the child process request
-        Map<String, Object> req = new HashMap<>();
-        req.put(Constants.Request.ENTRY_POINT_KEY, entryPoint);
-
-        if (!arguments.isEmpty()) {
-            req.put(Constants.Request.ARGUMENTS_KEY, new HashMap<>(arguments));
-        }
-
         if (!outVars.isEmpty()) {
-            req.put(Constants.Request.OUT_EXPRESSIONS_KEY, outVars);
+            taskMessage.put("outVars", new ArrayList<>(outVars));
         }
 
-        // set requirements to route to the boxcutter agent
-        Map<String, Object> requirements = new HashMap<>(params.requirements());
-        Map<String, Object> agentReqs = new HashMap<>();
-        agentReqs.put("boxcutterSession", sessionId);
-        requirements.put("agent", agentReqs);
-        req.put(Constants.Request.REQUIREMENTS, requirements);
+        String messageBody = objectMapper.writeValueAsString(taskMessage);
 
-        Map<String, Object> input = new HashMap<>();
-        ObjectMapper om = new ObjectMapper();
-        input.put("request", om.writeValueAsBytes(req));
-        input.put("parentInstanceId", currentProcessId);
+        log.info("Sending task to VM {} (taskId={}, type={})...", vmName, taskId,
+                command != null ? "command" : "entryPoint:" + entryPoint);
+        messageClient.send(vmName, "concord-task", messageBody);
 
-        log.info("Starting child process (entryPoint={}, session={})...", entryPoint, sessionId);
+        // Poll for the response
+        long timeout = params.timeout();
+        Map<String, Object> responseData = waitForTaskResponse(taskId, sessionId, timeout);
 
-        StartProcessResponse resp = withClient(client -> {
-            ProcessApi api = new ProcessApi(client);
-            return api.startProcess(input);
-        });
+        // Check for errors
+        String error = (String) responseData.get("error");
+        if (error != null) {
+            return TaskResult.fail("VM task failed: " + error);
+        }
 
-        UUID childProcessId = resp.getInstanceId();
-        log.info("Started child process: {}", childProcessId);
+        // Extract output variables
+        @SuppressWarnings("unchecked")
+        Map<String, Object> outputVars = (Map<String, Object>) responseData.getOrDefault("output", Collections.emptyMap());
 
-        // suspend the parent and wait for the child to complete
-        String eventName = UUID.randomUUID().toString();
+        // Merge output into session state
+        Map<String, Object> newState = new HashMap<>(sessionState);
+        newState.putAll(outputVars);
 
-        Map<String, Object> condition = new HashMap<>();
-        condition.put("type", "PROCESS_COMPLETION");
-        condition.put("reason", "Waiting for boxcutter step to complete");
-        condition.put("processes", Collections.singletonList(childProcessId));
-        condition.put("resumeEvent", eventName);
+        Map<String, Object> updatedSession = new HashMap<>(session);
+        updatedSession.put("state", newState);
 
-        ClientUtils.withRetry(3, 1000, () -> withClient(client -> {
-            ProcessApi api = new ProcessApi(client);
-            api.setWaitCondition(currentProcessId, condition);
-            return null;
-        }));
+        TaskResult.SimpleResult result = TaskResult.success()
+                .value("session", asSerializable(updatedSession));
 
-        // build resume payload
-        Map<String, Serializable> resumeState = new HashMap<>();
-        resumeState.put("childProcessId", childProcessId.toString());
-        resumeState.put("session", asSerializable(session));
+        // Also set output vars as top-level result values
+        for (Map.Entry<String, Object> entry : outputVars.entrySet()) {
+            Object v = entry.getValue();
+            if (v instanceof Serializable) {
+                result.value(entry.getKey(), v);
+            } else if (v != null) {
+                result.value(entry.getKey(), v.toString());
+            }
+        }
 
-        return TaskResult.reentrantSuspend(eventName, resumeState);
+        // Include stdout/stderr if present
+        String stdout = (String) responseData.get("stdout");
+        String stderr = (String) responseData.get("stderr");
+        if (stdout != null) {
+            result.value("stdout", stdout);
+        }
+        if (stderr != null) {
+            result.value("stderr", stderr);
+        }
+
+        Integer exitCode = (Integer) responseData.get("exitCode");
+        if (exitCode != null) {
+            result.value("exitCode", exitCode);
+        }
+
+        return result;
     }
 
     private TaskResult destroy(BoxcutterParams params) throws Exception {
         Map<String, Object> session = params.session();
-        String host;
-        String sshKeyPath;
         String vmName;
 
         if (!session.isEmpty()) {
-            host = (String) session.get("host");
-            sshKeyPath = (String) session.get("sshKeyPath");
             vmName = (String) session.get("vmName");
         } else {
-            host = params.host();
-            sshKeyPath = params.sshKeyPath();
             vmName = params.vmName();
         }
 
@@ -245,12 +234,20 @@ public class BoxcutterTaskCommon {
             throw new IllegalArgumentException("VM name is required for destroy action");
         }
 
-        if (sshKeyPath != null && sshKeyPath.isEmpty()) {
-            sshKeyPath = null;
+        log.info("Destroying boxcutter VM: {}", vmName);
+
+        // Send shutdown message to the runner (best-effort)
+        try {
+            Map<String, Object> shutdownMsg = Map.of(
+                    "type", "shutdown",
+                    "taskId", UUID.randomUUID().toString()
+            );
+            messageClient.send(vmName, "concord-task", objectMapper.writeValueAsString(shutdownMsg));
+        } catch (Exception e) {
+            log.debug("Failed to send shutdown message (VM may already be gone): {}", e.getMessage());
         }
 
-        log.info("Destroying boxcutter VM: {} on host {}", vmName, host);
-        SshCommand.Result result = SshCommand.exec(host, sshKeyPath, "destroy", vmName);
+        BoxcutterCommand.Result result = BoxcutterCommand.exec("destroy", vmName);
 
         if (result.exitCode() != 0) {
             log.warn("Failed to destroy VM {} (exit code {}): {}", vmName, result.exitCode(), result.output());
@@ -262,131 +259,299 @@ public class BoxcutterTaskCommon {
                 .value("destroyed", result.exitCode() == 0);
     }
 
-    private void bootstrapAgent(String boxcutterHost, String sshKeyPath,
-                                String vmName, String sessionId,
-                                String serverApiUrl, String serverApiKey,
-                                String agentJarPath, String sessionWorkDir) throws Exception {
-        // SSH into the boxcutter VM to configure and start the agent.
-        // The VM is expected to have Java 17+ and the agent JAR pre-installed.
-        // We write agent.conf and start the service.
+    private void deployRunner(String vmName, String sessionId) throws Exception {
+        // Deploy the runner script using boxcutter tapegun sendkeys.
+        // The runner is a bash script that:
+        // 1. Polls the metadata service for task messages
+        // 2. Executes commands or scripts
+        // 3. Sends results back to the orchestrator VM
 
-        String agentConfContent = buildAgentConf(sessionId, serverApiUrl, serverApiKey, sessionWorkDir);
+        String runnerScript = buildRunnerScript(sessionId, orchestratorVmName);
 
-        // write agent.conf via SSH
-        String writeConfCmd = String.format(
-                "mkdir -p /opt/concord/agent && cat > /opt/concord/agent/agent.conf << 'AGENT_CONF_EOF'\n%s\nAGENT_CONF_EOF",
-                agentConfContent);
+        // Write the runner script to the VM and start it
+        // We use sendkeys to inject commands into the VM's tmux pane
+        String deployCmd = String.format(
+                "cat > /tmp/concord-runner.sh << 'RUNNER_EOF'\n%s\nRUNNER_EOF\nchmod +x /tmp/concord-runner.sh && nohup /tmp/concord-runner.sh > /tmp/concord-runner.log 2>&1 &",
+                runnerScript);
 
-        SshCommand.Result confResult = SshCommand.exec(
-                vmName, sshKeyPath, "bash", "-c", writeConfCmd);
-        confResult.assertSuccess("Failed to write agent.conf on VM " + vmName);
-
-        // start the agent
-        String startCmd = String.format(
-                "nohup java -jar %s > /opt/concord/agent/agent.log 2>&1 &",
-                agentJarPath);
-
-        SshCommand.Result startResult = SshCommand.exec(
-                vmName, sshKeyPath, "bash", "-c", startCmd);
-        startResult.assertSuccess("Failed to start concord agent on VM " + vmName);
-
-        log.info("Agent bootstrap complete on VM {}", vmName);
+        BoxcutterCommand.exec("tapegun", "sendkeys", vmName, deployCmd);
+        log.info("Deployed runner script to VM {}", vmName);
     }
 
-    private String buildAgentConf(String sessionId, String serverApiUrl, String serverApiKey, String sessionWorkDir) {
-        // Generate a minimal agent.conf for the boxcutter VM
-        StringBuilder sb = new StringBuilder();
-        sb.append("concord-agent {\n");
-        sb.append("    capabilities {\n");
-        sb.append("        boxcutterSession = \"").append(sessionId).append("\"\n");
-        sb.append("    }\n");
-        sb.append("    workersCount = 1\n");
+    static String buildRunnerScript(String sessionId, String orchestratorVm) {
+        // Generate a bash runner script that runs on the VM.
+        // It polls the metadata service inbox for concord-task messages,
+        // executes them, and sends results back.
+        return """
+                #!/bin/bash
+                set -euo pipefail
 
-        if (serverApiUrl != null) {
-            sb.append("    server {\n");
-            sb.append("        apiBaseUrl = \"").append(serverApiUrl).append("\"\n");
-            sb.append("        websocketUrl = \"").append(serverApiUrl.replace("http", "ws")).append("/websocket\"\n");
-            if (serverApiKey != null) {
-                sb.append("        apiKey = \"").append(serverApiKey).append("\"\n");
-            }
-            sb.append("    }\n");
-        }
+                METADATA_URL="http://169.254.169.254"
+                SESSION_ID="%s"
+                REPLY_TO="%s"
+                WORK_DIR="/tmp/concord-work"
 
-        sb.append("    runner {\n");
-        if (sessionWorkDir != null) {
-            sb.append("        sessionWorkDir = \"").append(sessionWorkDir).append("\"\n");
-        }
-        sb.append("    }\n");
+                mkdir -p "$WORK_DIR"
 
-        sb.append("}\n");
-        return sb.toString();
+                log() {
+                    echo "[concord-runner $(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"
+                }
+
+                send_message() {
+                    local to="$1"
+                    local subject="$2"
+                    local body="$3"
+                    curl -sf -X POST "$METADATA_URL/messages/send" \\
+                        -H "Content-Type: application/json" \\
+                        -d "$(printf '{"to":"%%s","subject":"%%s","body":"%%s"}' "$to" "$subject" "$(echo "$body" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g; s/\\t/\\\\t/g; s/\\r/\\\\r/g')")" \\
+                        > /dev/null 2>&1
+                }
+
+                send_json_message() {
+                    local to="$1"
+                    local subject="$2"
+                    local body_file="$3"
+                    local payload
+                    payload=$(jq -n --arg to "$to" --arg subject "$subject" --rawfile body "$body_file" \\
+                        '{to: $to, subject: $subject, body: $body}')
+                    curl -sf -X POST "$METADATA_URL/messages/send" \\
+                        -H "Content-Type: application/json" \\
+                        -d "$payload" > /dev/null 2>&1
+                }
+
+                ack_message() {
+                    curl -sf -X DELETE "$METADATA_URL/messages/$1" > /dev/null 2>&1 || true
+                }
+
+                # Signal readiness
+                log "Runner starting (session=$SESSION_ID)"
+                READY_BODY=$(printf '{"type":"ready","sessionId":"%%s"}' "$SESSION_ID")
+                send_message "$REPLY_TO" "concord-response" "$READY_BODY"
+                log "Sent ready signal to $REPLY_TO"
+
+                # Main message processing loop
+                while true; do
+                    MSGS=$(curl -sf "$METADATA_URL/messages" 2>/dev/null || echo "[]")
+
+                    if [ "$MSGS" = "[]" ] || [ -z "$MSGS" ]; then
+                        sleep 2
+                        continue
+                    fi
+
+                    echo "$MSGS" | jq -c '.[]' 2>/dev/null | while IFS= read -r msg; do
+                        MSG_ID=$(echo "$msg" | jq -r '.id')
+                        SUBJECT=$(echo "$msg" | jq -r '.subject')
+                        BODY=$(echo "$msg" | jq -r '.body')
+
+                        # Only process concord-task messages
+                        if [ "$SUBJECT" != "concord-task" ]; then
+                            ack_message "$MSG_ID"
+                            continue
+                        fi
+
+                        TASK_ID=$(echo "$BODY" | jq -r '.taskId // empty')
+                        MSG_TYPE=$(echo "$BODY" | jq -r '.type // empty')
+
+                        if [ -z "$TASK_ID" ]; then
+                            ack_message "$MSG_ID"
+                            continue
+                        fi
+
+                        log "Processing task $TASK_ID (type=$MSG_TYPE)"
+                        ack_message "$MSG_ID"
+
+                        # Handle shutdown
+                        if [ "$MSG_TYPE" = "shutdown" ]; then
+                            log "Shutdown requested, exiting"
+                            exit 0
+                        fi
+
+                        # Process the task
+                        RESULT_FILE=$(mktemp)
+
+                        if [ "$MSG_TYPE" = "command" ]; then
+                            CMD=$(echo "$BODY" | jq -r '.command')
+                            ARGS_JSON=$(echo "$BODY" | jq -r '.arguments // {}')
+
+                            # Export arguments as environment variables
+                            eval "$(echo "$ARGS_JSON" | jq -r 'to_entries[] | "export CONCORD_ARG_\\(.key)=\\(.value | tostring)"' 2>/dev/null || true)"
+
+                            # Run the command
+                            STDOUT_FILE=$(mktemp)
+                            STDERR_FILE=$(mktemp)
+                            EXIT_CODE=0
+                            cd "$WORK_DIR"
+                            eval "$CMD" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
+
+                            STDOUT_CONTENT=$(cat "$STDOUT_FILE" | head -c 65536)
+                            STDERR_CONTENT=$(cat "$STDERR_FILE" | head -c 65536)
+
+                            # Build result with output vars from env
+                            OUT_VARS=$(echo "$BODY" | jq -r '.outVars // []')
+                            OUTPUT_JSON="{}"
+                            if [ "$OUT_VARS" != "[]" ]; then
+                                for var in $(echo "$OUT_VARS" | jq -r '.[]'); do
+                                    VAR_NAME="CONCORD_OUT_$var"
+                                    VAR_VAL="${!VAR_NAME:-}"
+                                    if [ -n "$VAR_VAL" ]; then
+                                        OUTPUT_JSON=$(echo "$OUTPUT_JSON" | jq --arg k "$var" --arg v "$VAR_VAL" '. + {($k): $v}')
+                                    fi
+                                done
+                            fi
+
+                            jq -n \\
+                                --arg taskId "$TASK_ID" \\
+                                --arg sessionId "$SESSION_ID" \\
+                                --arg stdout "$STDOUT_CONTENT" \\
+                                --arg stderr "$STDERR_CONTENT" \\
+                                --argjson exitCode "$EXIT_CODE" \\
+                                --argjson output "$OUTPUT_JSON" \\
+                                '{type:"result", taskId:$taskId, sessionId:$sessionId, stdout:$stdout, stderr:$stderr, exitCode:$exitCode, output:$output}' \\
+                                > "$RESULT_FILE"
+
+                            rm -f "$STDOUT_FILE" "$STDERR_FILE"
+
+                        elif [ "$MSG_TYPE" = "entryPoint" ]; then
+                            ENTRY_POINT=$(echo "$BODY" | jq -r '.entryPoint')
+                            ARGS_JSON=$(echo "$BODY" | jq -c '.arguments // {}')
+                            OUT_VARS=$(echo "$BODY" | jq -c '.outVars // []')
+
+                            # For entryPoint tasks, we create a script from the arguments
+                            # and the entry point name, then execute it
+                            SCRIPT_FILE="$WORK_DIR/entrypoint-${ENTRY_POINT}.sh"
+
+                            if [ -f "$SCRIPT_FILE" ]; then
+                                # Execute existing entry point script
+                                chmod +x "$SCRIPT_FILE"
+
+                                STDOUT_FILE=$(mktemp)
+                                STDERR_FILE=$(mktemp)
+                                EXIT_CODE=0
+
+                                # Pass arguments as JSON via env
+                                export CONCORD_ARGS="$ARGS_JSON"
+                                export CONCORD_ENTRY_POINT="$ENTRY_POINT"
+                                export CONCORD_OUT_VARS="$OUT_VARS"
+                                export CONCORD_WORK_DIR="$WORK_DIR"
+
+                                cd "$WORK_DIR"
+                                bash "$SCRIPT_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
+
+                                STDOUT_CONTENT=$(cat "$STDOUT_FILE" | head -c 65536)
+                                STDERR_CONTENT=$(cat "$STDERR_FILE" | head -c 65536)
+
+                                # Read output vars from the output file if it exists
+                                OUTPUT_JSON="{}"
+                                if [ -f "$WORK_DIR/.concord-output.json" ]; then
+                                    OUTPUT_JSON=$(cat "$WORK_DIR/.concord-output.json")
+                                    rm -f "$WORK_DIR/.concord-output.json"
+                                fi
+
+                                jq -n \\
+                                    --arg taskId "$TASK_ID" \\
+                                    --arg sessionId "$SESSION_ID" \\
+                                    --arg stdout "$STDOUT_CONTENT" \\
+                                    --arg stderr "$STDERR_CONTENT" \\
+                                    --argjson exitCode "$EXIT_CODE" \\
+                                    --argjson output "$OUTPUT_JSON" \\
+                                    '{type:"result", taskId:$taskId, sessionId:$sessionId, stdout:$stdout, stderr:$stderr, exitCode:$exitCode, output:$output}' \\
+                                    > "$RESULT_FILE"
+
+                                rm -f "$STDOUT_FILE" "$STDERR_FILE"
+                            else
+                                # No script found - report error
+                                jq -n \\
+                                    --arg taskId "$TASK_ID" \\
+                                    --arg sessionId "$SESSION_ID" \\
+                                    --arg error "Entry point script not found: $SCRIPT_FILE" \\
+                                    '{type:"result", taskId:$taskId, sessionId:$sessionId, error:$error}' \\
+                                    > "$RESULT_FILE"
+                            fi
+                        else
+                            jq -n \\
+                                --arg taskId "$TASK_ID" \\
+                                --arg sessionId "$SESSION_ID" \\
+                                --arg error "Unknown task type: $MSG_TYPE" \\
+                                '{type:"result", taskId:$taskId, sessionId:$sessionId, error:$error}' \\
+                                > "$RESULT_FILE"
+                        fi
+
+                        # Send the result back
+                        log "Sending result for task $TASK_ID"
+                        send_json_message "$REPLY_TO" "concord-response" "$RESULT_FILE"
+                        rm -f "$RESULT_FILE"
+
+                    done
+                done
+                """.formatted(sessionId, orchestratorVm);
     }
 
-    private void waitForAgent(String sessionId) throws Exception {
-        long deadline = System.currentTimeMillis() + AGENT_READY_TIMEOUT_MS;
+    private void waitForRunnerReady(String vmName, String sessionId) throws Exception {
+        long deadline = System.currentTimeMillis() + RUNNER_READY_TIMEOUT_MS;
 
         while (System.currentTimeMillis() < deadline) {
-            try {
-                // check if the server sees an agent with our session capability
-                // by starting a no-op "ping" check via the API
-                // We poll the process queue requirements endpoint indirectly:
-                // if the agent is connected, it will be visible in connected agents
-                boolean ready = checkAgentReady(sessionId);
-                if (ready) {
-                    log.info("Boxcutter agent (session={}) is ready", sessionId);
-                    return;
+            List<MetadataMessageClient.Message> messages = messageClient.readMessages();
+
+            for (MetadataMessageClient.Message msg : messages) {
+                if (!"concord-response".equals(msg.subject())) {
+                    // Not for us, but ack to clear it (it came back in-flight)
+                    continue;
                 }
-            } catch (Exception e) {
-                log.debug("Agent readiness check failed: {}", e.getMessage());
+
+                try {
+                    Map<String, Object> body = objectMapper.readValue(msg.body(), new TypeReference<>() {});
+                    String type = (String) body.get("type");
+                    String msgSessionId = (String) body.get("sessionId");
+
+                    if ("ready".equals(type) && sessionId.equals(msgSessionId)) {
+                        messageClient.acknowledge(msg.id());
+                        log.info("Runner on VM {} is ready (session={})", vmName, sessionId);
+                        return;
+                    }
+                } catch (Exception e) {
+                    log.debug("Failed to parse ready message: {}", e.getMessage());
+                }
             }
 
-            Thread.sleep(AGENT_READY_POLL_MS);
+            Thread.sleep(POLL_INTERVAL_MS);
         }
 
-        throw new RuntimeException("Timeout waiting for boxcutter agent (session=" + sessionId +
-                ") to connect (waited " + AGENT_READY_TIMEOUT_MS + "ms)");
+        throw new RuntimeException("Timeout waiting for runner on VM " + vmName +
+                " to become ready (waited " + RUNNER_READY_TIMEOUT_MS + "ms)");
     }
 
-    private boolean checkAgentReady(String sessionId) throws Exception {
-        // Start a lightweight "probe" process to see if the agent picks it up.
-        // Instead, we use a simpler heuristic: try to list agents.
-        // The Concord server doesn't have a direct "list connected agents" public API,
-        // so we do a best-effort check by briefly sleeping and assuming the agent
-        // connected if enough time has passed since bootstrap.
-        //
-        // A more robust implementation would add a server API endpoint to query
-        // connected agents by capability, or have the agent write a ready marker
-        // that we can check via SSH.
-        //
-        // For now, after the first successful poll interval, we optimistically
-        // return true. The agent bootstrap includes starting the service, and
-        // the WebSocket connection typically establishes within a few seconds.
-        return true;
-    }
+    private Map<String, Object> waitForTaskResponse(String taskId, String sessionId, long timeoutMs) throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> getOutVars(UUID processId) throws Exception {
-        return withClient(client -> {
-            ProcessApi api = new ProcessApi(client);
+        while (System.currentTimeMillis() < deadline) {
+            List<MetadataMessageClient.Message> messages = messageClient.readMessages();
 
-            try (InputStream is = api.downloadAttachment(processId, "out.json")) {
-                ObjectMapper om = new ObjectMapper();
-                return om.readValue(is, Map.class);
-            } catch (ApiException e) {
-                if (e.getCode() == 404) {
-                    return Collections.emptyMap();
+            for (MetadataMessageClient.Message msg : messages) {
+                if (!"concord-response".equals(msg.subject())) {
+                    continue;
                 }
-                throw e;
-            }
-        });
-    }
 
-    private <T> T withClient(ClientCall<T> call) throws Exception {
-        ApiClient client = apiClientFactory.create(
-                ApiClientConfiguration.builder()
-                        .sessionToken(sessionToken)
-                        .build());
-        return call.call(client);
+                try {
+                    Map<String, Object> body = objectMapper.readValue(msg.body(), new TypeReference<>() {});
+                    String type = (String) body.get("type");
+                    String respTaskId = (String) body.get("taskId");
+                    String respSessionId = (String) body.get("sessionId");
+
+                    if ("result".equals(type) && taskId.equals(respTaskId) && sessionId.equals(respSessionId)) {
+                        messageClient.acknowledge(msg.id());
+                        log.info("Received result for task {}", taskId);
+                        return body;
+                    }
+                } catch (Exception e) {
+                    log.debug("Failed to parse response message: {}", e.getMessage());
+                }
+            }
+
+            Thread.sleep(POLL_INTERVAL_MS);
+        }
+
+        throw new RuntimeException("Timeout waiting for task " + taskId +
+                " response (waited " + timeoutMs + "ms)");
     }
 
     private String parseVmName(String output, String requestedName) {
@@ -394,26 +559,31 @@ public class BoxcutterTaskCommon {
             return requestedName;
         }
 
-        // boxcutter outputs the VM name/info on creation
-        // try to extract the name from the output
+        // boxcutter list output shows VM names - parse the creation output
         String trimmed = output.trim();
         if (!trimmed.isEmpty()) {
-            // take the last non-empty line as the VM identifier
             String[] lines = trimmed.split("\n");
             for (int i = lines.length - 1; i >= 0; i--) {
                 String line = lines[i].trim();
                 if (!line.isEmpty()) {
+                    // The VM name is typically the last meaningful word
+                    // boxcutter outputs something like "Created VM: <name>"
+                    if (line.contains(":")) {
+                        String afterColon = line.substring(line.lastIndexOf(':') + 1).trim();
+                        if (!afterColon.isEmpty()) {
+                            return afterColon;
+                        }
+                    }
                     return line;
                 }
             }
         }
 
-        // fallback: generate a name
         return "concord-vm-" + UUID.randomUUID().toString().substring(0, 8);
     }
 
     @SuppressWarnings("unchecked")
-    private static HashMap<String, Serializable> asSerializable(Map<String, Object> map) {
+    static HashMap<String, Serializable> asSerializable(Map<String, Object> map) {
         HashMap<String, Serializable> result = new HashMap<>();
         for (Map.Entry<String, Object> entry : map.entrySet()) {
             Object value = entry.getValue();
@@ -426,10 +596,5 @@ public class BoxcutterTaskCommon {
             }
         }
         return result;
-    }
-
-    @FunctionalInterface
-    private interface ClientCall<T> {
-        T call(ApiClient client) throws Exception;
     }
 }
