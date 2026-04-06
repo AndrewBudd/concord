@@ -269,7 +269,11 @@ public class BoxcutterTaskCommon {
         // 3. Sends results back to the orchestrator VM
 
         String runnerScript = buildRunnerScript(sessionId, orchestratorVmName);
-        String base64Script = Base64.getEncoder().encodeToString(runnerScript.getBytes());
+        // Strip leading whitespace from each line (Java text block indentation)
+        String cleanedScript = runnerScript.lines()
+                .map(String::stripLeading)
+                .collect(java.util.stream.Collectors.joining("\n"));
+        String base64Script = Base64.getEncoder().encodeToString(cleanedScript.getBytes());
 
         String deployCmd = "echo " + base64Script + " | base64 -d > /tmp/concord-runner.sh"
                 + " && chmod +x /tmp/concord-runner.sh"
@@ -339,10 +343,13 @@ public class BoxcutterTaskCommon {
                         continue
                     fi
 
-                    echo "$MSGS" | jq -c '.[]' 2>/dev/null | while IFS= read -r msg; do
-                        MSG_ID=$(echo "$msg" | jq -r '.id')
-                        SUBJECT=$(echo "$msg" | jq -r '.subject')
-                        BODY=$(echo "$msg" | jq -r '.body')
+                    # Process the first message only (avoid subshell issues with piped while-read)
+                    msg=$(echo "$MSGS" | jq -c '.[0]' 2>/dev/null)
+                    if [ -z "$msg" ] || [ "$msg" = "null" ]; then sleep 2; continue; fi
+
+                    MSG_ID=$(echo "$msg" | jq -r '.id')
+                    SUBJECT=$(echo "$msg" | jq -r '.subject')
+                    BODY=$(echo "$msg" | jq -r '.body')
 
                         # Only process concord-task messages
                         if [ "$SUBJECT" != "concord-task" ]; then
@@ -361,6 +368,9 @@ public class BoxcutterTaskCommon {
                         log "Processing task $TASK_ID (type=$MSG_TYPE)"
                         ack_message "$MSG_ID"
 
+                        # Clear any CONCORD_OUT_ vars from previous tasks
+                        for v in $(env | grep '^CONCORD_OUT_' | cut -d= -f1); do unset "$v"; done
+
                         # Handle shutdown
                         if [ "$MSG_TYPE" = "shutdown" ]; then
                             log "Shutdown requested, exiting"
@@ -375,30 +385,49 @@ public class BoxcutterTaskCommon {
                             ARGS_JSON=$(echo "$BODY" | jq -r '.arguments // {}')
 
                             # Export arguments as environment variables
-                            eval "$(echo "$ARGS_JSON" | jq -r 'to_entries[] | "export CONCORD_ARG_\\(.key)=\\(.value | tostring)"' 2>/dev/null || true)"
+                            ARGS_ENV_FILE=$(mktemp)
+                            echo "$ARGS_JSON" | jq -r 'to_entries[] | "CONCORD_ARG_\\(.key)=\\(.value | tostring)"' > "$ARGS_ENV_FILE" 2>/dev/null || true
+                            while IFS='=' read -r key val; do export "$key=$val"; done < "$ARGS_ENV_FILE"
+                            rm -f "$ARGS_ENV_FILE"
 
-                            # Run the command
+                            # Run the command in a wrapper that captures CONCORD_OUT_ vars
                             STDOUT_FILE=$(mktemp)
                             STDERR_FILE=$(mktemp)
+                            ENV_FILE=$(mktemp)
+                            WRAPPER_FILE=$(mktemp)
                             EXIT_CODE=0
                             cd "$WORK_DIR"
-                            eval "$CMD" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
+
+                            # Write a wrapper script that runs the command and dumps CONCORD_OUT_ vars
+                            cat > "$WRAPPER_FILE" << 'WRAPPER_EOF'
+#!/bin/bash
+set +e
+eval "$CONCORD_CMD"
+CMD_EXIT=$?
+# Dump CONCORD_OUT_ vars to the env file
+env | grep '^CONCORD_OUT_' > "$CONCORD_ENV_FILE" 2>/dev/null || true
+exit $CMD_EXIT
+WRAPPER_EOF
+                            chmod +x "$WRAPPER_FILE"
+
+                            CONCORD_CMD="$CMD" CONCORD_ENV_FILE="$ENV_FILE" \\
+                                bash "$WRAPPER_FILE" > "$STDOUT_FILE" 2> "$STDERR_FILE" || EXIT_CODE=$?
 
                             STDOUT_CONTENT=$(cat "$STDOUT_FILE" | head -c 65536)
                             STDERR_CONTENT=$(cat "$STDERR_FILE" | head -c 65536)
 
-                            # Build result with output vars from env
+                            # Read output vars from the env dump file
                             OUT_VARS=$(echo "$BODY" | jq -r '.outVars // []')
                             OUTPUT_JSON="{}"
-                            if [ "$OUT_VARS" != "[]" ]; then
+                            if [ "$OUT_VARS" != "[]" ] && [ -f "$ENV_FILE" ]; then
                                 for var in $(echo "$OUT_VARS" | jq -r '.[]'); do
-                                    VAR_NAME="CONCORD_OUT_$var"
-                                    VAR_VAL="${!VAR_NAME:-}"
+                                    VAR_VAL=$(grep "^CONCORD_OUT_${var}=" "$ENV_FILE" | head -1 | cut -d= -f2-)
                                     if [ -n "$VAR_VAL" ]; then
                                         OUTPUT_JSON=$(echo "$OUTPUT_JSON" | jq --arg k "$var" --arg v "$VAR_VAL" '. + {($k): $v}')
                                     fi
                                 done
                             fi
+                            rm -f "$WRAPPER_FILE" "$ENV_FILE"
 
                             jq -n \\
                                 --arg taskId "$TASK_ID" \\
@@ -482,7 +511,6 @@ public class BoxcutterTaskCommon {
                         send_json_message "$REPLY_TO" "concord-response" "$RESULT_FILE"
                         rm -f "$RESULT_FILE"
 
-                    done
                 done
                 """.formatted(sessionId, orchestratorVm);
     }
@@ -560,22 +588,18 @@ public class BoxcutterTaskCommon {
             return requestedName;
         }
 
-        // boxcutter list output shows VM names - parse the creation output
+        // boxcutter 'new' output includes "Name:    <vm-name>"
+        // Parse that specific line to extract the VM name
         String trimmed = output.trim();
         if (!trimmed.isEmpty()) {
             String[] lines = trimmed.split("\n");
-            for (int i = lines.length - 1; i >= 0; i--) {
-                String line = lines[i].trim();
-                if (!line.isEmpty()) {
-                    // The VM name is typically the last meaningful word
-                    // boxcutter outputs something like "Created VM: <name>"
-                    if (line.contains(":")) {
-                        String afterColon = line.substring(line.lastIndexOf(':') + 1).trim();
-                        if (!afterColon.isEmpty()) {
-                            return afterColon;
-                        }
+            for (String line : lines) {
+                String stripped = line.trim();
+                if (stripped.startsWith("Name:")) {
+                    String name = stripped.substring(5).trim();
+                    if (!name.isEmpty()) {
+                        return name;
                     }
-                    return line;
                 }
             }
         }
