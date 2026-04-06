@@ -45,7 +45,7 @@ public final class BoxcutterCommand {
 
     public static Result exec(long timeoutMs, String... args) throws Exception {
         List<String> cmd = new ArrayList<>();
-        cmd.add("boxcutter");
+        cmd.add("/tools/bin/boxcutter");
         for (String a : args) {
             cmd.add(a);
         }

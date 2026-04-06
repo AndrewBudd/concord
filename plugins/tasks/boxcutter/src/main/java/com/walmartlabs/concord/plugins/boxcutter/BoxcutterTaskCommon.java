@@ -28,6 +28,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.util.*;
+import java.util.Base64;
 
 /**
  * Core logic for the boxcutter task plugin. Orchestrates ephemeral VMs
@@ -260,21 +261,21 @@ public class BoxcutterTaskCommon {
     }
 
     private void deployRunner(String vmName, String sessionId) throws Exception {
-        // Deploy the runner script using boxcutter tapegun sendkeys.
+        // Deploy the runner script to the VM using boxcutter exec + base64.
+        // Base64 encoding avoids heredoc/quoting issues when passing through exec.
         // The runner is a bash script that:
         // 1. Polls the metadata service for task messages
         // 2. Executes commands or scripts
         // 3. Sends results back to the orchestrator VM
 
         String runnerScript = buildRunnerScript(sessionId, orchestratorVmName);
+        String base64Script = Base64.getEncoder().encodeToString(runnerScript.getBytes());
 
-        // Write the runner script to the VM and start it
-        // We use sendkeys to inject commands into the VM's tmux pane
-        String deployCmd = String.format(
-                "cat > /tmp/concord-runner.sh << 'RUNNER_EOF'\n%s\nRUNNER_EOF\nchmod +x /tmp/concord-runner.sh && nohup /tmp/concord-runner.sh > /tmp/concord-runner.log 2>&1 &",
-                runnerScript);
+        String deployCmd = "echo " + base64Script + " | base64 -d > /tmp/concord-runner.sh"
+                + " && chmod +x /tmp/concord-runner.sh"
+                + " && nohup /tmp/concord-runner.sh > /tmp/concord-runner.log 2>&1 &";
 
-        BoxcutterCommand.exec("tapegun", "sendkeys", vmName, deployCmd);
+        BoxcutterCommand.exec("exec", vmName, deployCmd);
         log.info("Deployed runner script to VM {}", vmName);
     }
 
